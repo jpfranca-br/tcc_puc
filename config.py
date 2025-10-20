@@ -36,6 +36,8 @@ class AppConfig:
     ocr_engine: str = "easyocr"
     ocr_gpu: bool = True
     easyocr_multivariant: bool = False
+    ocr_accumulate_best: bool = False
+    ocr_accumulation_seconds: float = 5.0
 
     # Thresholds
     conf_threshold_low: float = 0.20
@@ -94,6 +96,9 @@ def parse_config() -> AppConfig:
     parser.add_argument("--ocr-gpu", action="store_true", default=True)
     parser.add_argument("--ocr-cpu", action="store_false", dest="ocr_gpu")
     parser.add_argument("--easyocr-multivariant", action="store_true", default=False)
+    parser.add_argument("--ocr-accumulate-best", action="store_true", default=False)
+    parser.add_argument("--no-ocr-accumulate-best", action="store_false", dest="ocr_accumulate_best")
+    parser.add_argument("--ocr-accumulation-seconds", type=float, default=5.0)
     parser.add_argument("--conf-threshold-low", type=float, default=0.50)
     parser.add_argument("--conf-threshold-high", type=float, default=0.80)
     parser.add_argument("--char-count-low", type=int, default=3)
@@ -125,6 +130,8 @@ def parse_config() -> AppConfig:
         ocr_engine=args.ocr_engine,
         ocr_gpu=args.ocr_gpu,
         easyocr_multivariant=args.easyocr_multivariant,
+        ocr_accumulate_best=args.ocr_accumulate_best,
+        ocr_accumulation_seconds=args.ocr_accumulation_seconds,
         conf_threshold_low=args.conf_threshold_low,
         conf_threshold_high=args.conf_threshold_high,
         char_count_low=args.char_count_low,
