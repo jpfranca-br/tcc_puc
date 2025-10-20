@@ -28,6 +28,7 @@ class AppConfig:
 
     # Model toggles
     model_path: str = "./models/license_plate_detector.pt"
+    vehicle_model_path: str | None = "yolov8n.pt"
     opencv_pre_yolo: bool = False
     target_yolo_width: int = 640
     yolo_warmup: bool = True
@@ -84,6 +85,7 @@ def parse_config() -> AppConfig:
     parser.add_argument("--show-window", action="store_true", default=True)
     parser.add_argument("--no-window", action="store_false", dest="show_window")
     parser.add_argument("--model-path", default="./models/license_plate_detector.pt")
+    parser.add_argument("--vehicle-model-path", default="yolov8n.pt")
     parser.add_argument("--opencv-pre-yolo", action="store_true", default=False)
     parser.add_argument("--target-yolo-width", type=int, default=640)
     parser.add_argument("--yolo-warmup", action="store_true", default=True)
@@ -124,6 +126,9 @@ def parse_config() -> AppConfig:
         frame_queue_size=args.frame_queue_size,
         show_window=args.show_window,
         model_path=args.model_path,
+        vehicle_model_path=(
+            None if str(args.vehicle_model_path).lower() == "none" else args.vehicle_model_path
+        ),
         opencv_pre_yolo=args.opencv_pre_yolo,
         target_yolo_width=args.target_yolo_width,
         yolo_warmup=args.yolo_warmup,
