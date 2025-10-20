@@ -158,6 +158,7 @@ def main() -> None:
     # Track meta information for each object ID produced by the tracker.
     track_history: Dict[int, Dict[str, object]] = {}
     ocr_method_stats: Dict[int, Dict[str, Dict[str, object]]] = {}
+    ocr_accumulators: Dict[int, Dict[str, object]] = {}
 
     ocr_calls = 0
     ocr_success = 0
@@ -207,6 +208,67 @@ def main() -> None:
     atexit.register(print_run_summary)
 
     processing_start_ts = time.perf_counter()
+
+    def _run_ocr_for_track(track_id: int, crop: np.ndarray, now_ts: float) -> OCRResult:
+        """Execute OCR for a single track and update bookkeeping."""
+
+        nonlocal ocr_calls, ocr_last_dt, ocr_min, ocr_max, ocr_success
+
+        ocr_calls += 1
+        ocr_t0 = time.perf_counter()
+        try:
+            result = ocr_manager.run(crop)
+        except Exception as exc:
+            print(f"OCR error for track {track_id}: {exc}")
+            result = OCRResult(None, 0.0, "-")
+        ocr_last_dt = time.perf_counter() - ocr_t0
+        ocr_min = min(ocr_min, ocr_last_dt)
+        ocr_max = max(ocr_max, ocr_last_dt)
+
+        info = track_history.get(track_id)
+        if info is not None:
+            info["last_ocr_attempt"] = now_ts
+
+        if track_id not in ocr_method_stats:
+            ocr_method_stats[track_id] = {}
+        track_methods = ocr_method_stats[track_id]
+        current_best = track_methods.get(result.method, {"best_conf": 0.0, "plate": ""})
+        if result.confidence > current_best["best_conf"]:
+            track_methods[result.method] = {
+                "best_conf": result.confidence,
+                "plate": result.text,
+            }
+
+        if info is not None and result.text:
+            cleaned = result.text
+            info["method"] = result.method
+            if (
+                result.confidence >= config.conf_threshold_high
+                and len(cleaned) >= config.char_count_high
+            ):
+                info.update(
+                    {
+                        "name": cleaned,
+                        "confidence": f" ({result.confidence:.0%})",
+                        "ocr_done": True,
+                        "ocr_certain": True,
+                    }
+                )
+                ocr_success += 1
+            elif (
+                result.confidence >= config.conf_threshold_low
+                and len(cleaned) >= config.char_count_low
+            ):
+                info.update(
+                    {
+                        "name": cleaned,
+                        "confidence": f" ({result.confidence:.0%})",
+                        "ocr_done": True,
+                    }
+                )
+                ocr_success += 1
+
+        return result
 
     try:
         # Main processing loop that stops on EOF or when a signal is received.
@@ -273,12 +335,17 @@ def main() -> None:
                     if scale != 1.0 and len(boxes) > 0:
                         boxes = (boxes / scale).astype(int)
 
+            active_track_ids: set[int] = set()
             # Convert YOLO output back into the original frame space.
             if track_ids.size > 0:
-                ocr_retry_wait = max(
-                    config.ocr_min_wait,
-                    config.ocr_wait_multiplier * loop_dt * track_ids.size if loop_dt else config.ocr_min_wait,
-                )
+                active_track_ids = set(int(tid) for tid in track_ids)
+                if config.ocr_accumulate_best:
+                    ocr_retry_wait = max(config.ocr_accumulation_seconds, 0.0)
+                else:
+                    ocr_retry_wait = max(
+                        config.ocr_min_wait,
+                        config.ocr_wait_multiplier * loop_dt * track_ids.size if loop_dt else config.ocr_min_wait,
+                    )
                 ocr_retry_max = max(ocr_retry_wait, ocr_retry_max)
                 ocr_retry_min = min(ocr_retry_wait, ocr_retry_min)
 
@@ -294,64 +361,52 @@ def main() -> None:
 
                     info = track_history[track_id]
 
-                    if (not info["ocr_certain"]) and (now - info["last_ocr_attempt"] > ocr_retry_wait):
-                        info["last_ocr_attempt"] = now
-                        x1, y1, x2, y2 = box
-                        x1, y1 = max(0, x1), max(0, y1)
-                        x2, y2 = min(frame_width, x2), min(frame_height, y2)
-                        crop = input_frame[y1:y2, x1:x2]
-                        if crop.size == 0:
+                    if config.ocr_accumulate_best:
+                        accumulator = ocr_accumulators.setdefault(
+                            track_id,
+                            {
+                                "start": now,
+                                "best_area": 0,
+                                "best_crop": None,
+                                "last_seen": now,
+                            },
+                        )
+                        if info.get("ocr_certain"):
+                            ocr_accumulators.pop(track_id, None)
                             continue
 
-                        ocr_t0 = time.perf_counter()
-                        try:
-                            result: OCRResult = ocr_manager.run(crop)
-                            if track_id not in ocr_method_stats:
-                                ocr_method_stats[track_id] = {}
-                            track_methods = ocr_method_stats[track_id]
-                            current_best = track_methods.get(result.method, {"best_conf": 0.0, "plate": ""})
-                            if result.confidence > current_best["best_conf"]:
-                                track_methods[result.method] = {
-                                    "best_conf": result.confidence,
-                                    "plate": result.text,
-                                }
-                        except Exception as exc:
-                            print(f"OCR error for track {track_id}: {exc}")
-                            result = OCRResult(None, 0.0, "-")
+                    x1, y1, x2, y2 = box
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(frame_width, x2), min(frame_height, y2)
+                    crop = input_frame[y1:y2, x1:x2]
 
-                        ocr_last_dt = time.perf_counter() - ocr_t0
-                        ocr_min = min(ocr_min, ocr_last_dt)
-                        ocr_max = max(ocr_max, ocr_last_dt)
-                        ocr_calls += 1
+                    if config.ocr_accumulate_best:
+                        accumulator["last_seen"] = now
+                        if crop.size > 0:
+                            area = crop.shape[0] * crop.shape[1]
+                            if area > accumulator.get("best_area", 0):
+                                accumulator["best_area"] = area
+                                accumulator["best_crop"] = crop.copy()
+                        wait_elapsed = now - accumulator.get("start", now)
+                        if (
+                            not info.get("ocr_certain")
+                            and wait_elapsed >= config.ocr_accumulation_seconds
+                            and accumulator.get("best_crop") is not None
+                        ):
+                            _run_ocr_for_track(track_id, accumulator["best_crop"], now)
+                            if info.get("ocr_certain"):
+                                ocr_accumulators.pop(track_id, None)
+                            else:
+                                accumulator["start"] = now
+                                accumulator["best_area"] = 0
+                                accumulator["best_crop"] = None
+                        continue
 
-                        if result.text:
-                            cleaned = result.text
-                            info["method"] = result.method
-                            if (
-                                result.confidence >= config.conf_threshold_high
-                                and len(cleaned) >= config.char_count_high
-                            ):
-                                info.update(
-                                    {
-                                        "name": cleaned,
-                                        "confidence": f" ({result.confidence:.0%})",
-                                        "ocr_done": True,
-                                        "ocr_certain": True,
-                                    }
-                                )
-                                ocr_success += 1
-                            elif (
-                                result.confidence >= config.conf_threshold_low
-                                and len(cleaned) >= config.char_count_low
-                            ):
-                                info.update(
-                                    {
-                                        "name": cleaned,
-                                        "confidence": f" ({result.confidence:.0%})",
-                                        "ocr_done": True,
-                                    }
-                                )
-                                ocr_success += 1
+                    if crop.size == 0:
+                        continue
+
+                    if (not info["ocr_certain"]) and (now - info["last_ocr_attempt"] > ocr_retry_wait):
+                        _run_ocr_for_track(track_id, crop, now)
 
                 for box, track_id in zip(boxes, track_ids):
                     info = track_history.get(track_id, {})
@@ -376,6 +431,15 @@ def main() -> None:
                         2,
                         cv2.LINE_AA,
                     )
+
+            if config.ocr_accumulate_best:
+                lost_tracks = [tid for tid in list(ocr_accumulators.keys()) if tid not in active_track_ids]
+                for track_id in lost_tracks:
+                    accumulator = ocr_accumulators.pop(track_id)
+                    info = track_history.get(track_id)
+                    best_crop = accumulator.get("best_crop") if accumulator else None
+                    if info and not info.get("ocr_certain") and best_crop is not None:
+                        _run_ocr_for_track(track_id, best_crop, now)
 
             plates_total = len(track_history)
             plates_certain = sum(1 for v in track_history.values() if v.get("ocr_certain"))
