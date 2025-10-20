@@ -223,6 +223,51 @@ def main() -> None:
             "consider providing --vehicle-model-path for a dedicated vehicle detector."
         )
 
+    model_names = getattr(detector, "names", {}) or {}
+    if isinstance(model_names, dict):
+        class_name_map = {int(idx): str(name).lower() for idx, name in model_names.items()}
+    else:
+        class_name_map = {int(idx): str(name).lower() for idx, name in enumerate(model_names)}
+
+    plate_class_ids = {idx for idx, name in class_name_map.items() if "plate" in name}
+    vehicle_keywords = (
+        "vehicle",
+        "car",
+        "truck",
+        "bus",
+        "motorcycle",
+        "motorbike",
+        "van",
+        "automobile",
+        "auto",
+        "pickup",
+        "suv",
+        "carro",
+        "veiculo",
+        "caminhao",
+        "caminhonete",
+        "onibus",
+        "moto",
+    )
+    vehicle_class_ids = {
+        idx
+        for idx, name in class_name_map.items()
+        if any(keyword in name for keyword in vehicle_keywords)
+    }
+    if not plate_class_ids:
+        plate_class_ids = {0}
+    auto_vehicle_fallback = False
+    if not vehicle_class_ids:
+        fallback_ids = {idx for idx in class_name_map.keys() if idx not in plate_class_ids}
+        if fallback_ids:
+            vehicle_class_ids = fallback_ids
+        else:
+            auto_vehicle_fallback = True
+            print(
+                "No vehicle class names detected in the model metadata; "
+                "treating non-plate detections as vehicles."
+            )
+
     ocr_gpu = config.ocr_gpu and infer_kwargs.get("device", "cpu").startswith("cuda")
     # The OCR manager hides the differences between EasyOCR and Tesseract
     # so the rest of the loop can treat them uniformly.
