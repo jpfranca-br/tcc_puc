@@ -253,6 +253,8 @@ class OCRManager:
                     fragments.append(nested)
             return fragments
 
+        image_data_url = f"data:image/png;base64,{image_b64}"
+
         try:
             if hasattr(self._chatgpt_client, "responses"):
                 response = self._chatgpt_client.responses.create(
@@ -264,9 +266,7 @@ class OCRManager:
                                 {"type": "input_text", "text": prompt},
                                 {
                                     "type": "input_image",
-                                    "image_url": {
-                                        "url": f"data:image/png;base64,{image_b64}"
-                                    },
+                                    "image_url": image_data_url,
                                 },
                             ],
                         }
@@ -283,7 +283,7 @@ class OCRManager:
                                 {"type": "text", "text": "Read the license plate characters."},
                                 {
                                     "type": "image_url",
-                                    "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                                    "image_url": {"url": image_data_url},
                                 },
                             ],
                         },
