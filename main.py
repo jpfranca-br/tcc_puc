@@ -33,26 +33,33 @@ signal.signal(signal.SIGINT, _handle_stop_signal)
 signal.signal(signal.SIGTERM, _handle_stop_signal)
 
 
-def _initialise_detector(config: AppConfig) -> tuple[YOLO, dict]:
-    """Load the YOLO model according to the configured device."""
+def _initialise_detector(
+    config: AppConfig,
+    model_path: str,
+    device_name: str | None = None,
+    half_precision: bool | None = None,
+) -> tuple[YOLO, dict, str, bool]:
+    """Load a YOLO model according to the configured or provided device."""
 
-    try:
-        import torch
+    if device_name is None or half_precision is None:
+        try:
+            import torch
 
-        cuda_available = torch.cuda.is_available()
-    except Exception:
-        cuda_available = False
+            cuda_available = torch.cuda.is_available()
+        except Exception:
+            cuda_available = False
 
-    use_gpu = config.device_request == "gpu" and cuda_available
-    if config.device_request == "gpu" and not cuda_available:
-        print("GPU requested but not available. Falling back to CPU.")
-    device_name = "cuda:0" if use_gpu else "cpu"
+        use_gpu = config.device_request == "gpu" and cuda_available
+        if config.device_request == "gpu" and not cuda_available:
+            print("GPU requested but not available. Falling back to CPU.")
+        device_name = "cuda:0" if use_gpu else "cpu"
+        half_precision = use_gpu
 
-    detector = YOLO(config.model_path)
+    detector = YOLO(model_path)
     detector.to(device_name)
 
-    infer_kwargs: dict = {"device": device_name, "half": use_gpu}
-    return detector, infer_kwargs
+    infer_kwargs: dict = {"device": device_name, "half": half_precision}
+    return detector, infer_kwargs, device_name, half_precision
 
 
 def _setup_input(config: AppConfig):
@@ -105,7 +112,116 @@ def main() -> None:
 
     global SHOULD_STOP
     config = parse_config()
-    detector, infer_kwargs = _initialise_detector(config)
+    detector, infer_kwargs, device_name, half_precision = _initialise_detector(
+        config, config.model_path
+    )
+
+    model_names = getattr(detector, "names", {}) or {}
+    if isinstance(model_names, dict):
+        class_name_map = {int(idx): str(name).lower() for idx, name in model_names.items()}
+    else:
+        class_name_map = {int(idx): str(name).lower() for idx, name in enumerate(model_names)}
+
+    plate_class_ids = {idx for idx, name in class_name_map.items() if "plate" in name}
+    vehicle_keywords = (
+        "vehicle",
+        "car",
+        "truck",
+        "bus",
+        "motorcycle",
+        "motorbike",
+        "van",
+        "automobile",
+        "auto",
+        "pickup",
+        "suv",
+        "carro",
+        "veiculo",
+        "caminhao",
+        "caminhonete",
+        "onibus",
+        "moto",
+    )
+    vehicle_class_ids = {
+        idx
+        for idx, name in class_name_map.items()
+        if any(keyword in name for keyword in vehicle_keywords)
+    }
+    primary_auto_vehicle_fallback = False
+    if not plate_class_ids:
+        plate_class_ids = {0}
+
+    if not vehicle_class_ids:
+        fallback_ids = {idx for idx in class_name_map.keys() if idx not in plate_class_ids}
+        if fallback_ids:
+            vehicle_class_ids = fallback_ids
+            print(
+                "No explicit vehicle classes advertised; treating remaining classes as vehicles."
+            )
+        else:
+            primary_auto_vehicle_fallback = True
+
+    use_secondary_vehicle_model = False
+    secondary_vehicle_class_ids: set[int] = set()
+    secondary_auto_vehicle_fallback = False
+    vehicle_detector: YOLO | None = None
+    vehicle_infer_kwargs: dict | None = None
+
+    if primary_auto_vehicle_fallback and config.vehicle_model_path:
+        try:
+            vehicle_detector, vehicle_infer_kwargs, _, _ = _initialise_detector(
+                config,
+                config.vehicle_model_path,
+                device_name=device_name,
+                half_precision=half_precision,
+            )
+            vehicle_model_names = getattr(vehicle_detector, "names", {}) or {}
+            if isinstance(vehicle_model_names, dict):
+                vehicle_name_map = {
+                    int(idx): str(name).lower() for idx, name in vehicle_model_names.items()
+                }
+            else:
+                vehicle_name_map = {
+                    int(idx): str(name).lower()
+                    for idx, name in enumerate(vehicle_model_names)
+                }
+
+            secondary_vehicle_class_ids = {
+                idx
+                for idx, name in vehicle_name_map.items()
+                if any(keyword in name for keyword in vehicle_keywords)
+            }
+            if not secondary_vehicle_class_ids:
+                secondary_vehicle_class_ids = set(vehicle_name_map.keys())
+                secondary_auto_vehicle_fallback = True
+                print(
+                    "Secondary vehicle model does not expose recognised vehicle class names;"
+                    " treating all detections as vehicles."
+                )
+            else:
+                use_secondary_vehicle_model = True
+        except Exception as exc:
+            print(
+                "Failed to load secondary vehicle model "
+                f"'{config.vehicle_model_path}': {exc}. Falling back to box association only."
+            )
+            vehicle_detector = None
+            vehicle_infer_kwargs = None
+            secondary_vehicle_class_ids = set()
+            secondary_auto_vehicle_fallback = False
+            primary_auto_vehicle_fallback = True
+
+    if vehicle_detector is not None and not use_secondary_vehicle_model:
+        use_secondary_vehicle_model = bool(secondary_vehicle_class_ids)
+
+    if use_secondary_vehicle_model:
+        print(f"Using secondary vehicle model '{config.vehicle_model_path}' for vehicle tracking.")
+
+    if primary_auto_vehicle_fallback and not use_secondary_vehicle_model:
+        print(
+            "No vehicle detections available from the plate model; "
+            "consider providing --vehicle-model-path for a dedicated vehicle detector."
+        )
 
     model_names = getattr(detector, "names", {}) or {}
     if isinstance(model_names, dict):
@@ -214,7 +330,8 @@ def main() -> None:
     ocr_success = 0
     processed_frames = 0
     processing_start_ts = None
-    next_track_id = 0
+    next_plate_track_id = 0
+    next_vehicle_track_id = 0
     next_plate_global_id = 1
     next_vehicle_global_id = 1
 
@@ -383,9 +500,11 @@ def main() -> None:
                     if detections.id is not None:
                         track_ids = detections.id.cpu().numpy().astype(int)
                     else:
-                        generated_ids = np.arange(next_track_id, next_track_id + len(boxes))
+                        generated_ids = np.arange(
+                            next_plate_track_id, next_plate_track_id + len(boxes)
+                        )
                         track_ids = generated_ids.astype(int)
-                        next_track_id += len(generated_ids)
+                        next_plate_track_id += len(generated_ids)
                     if detections.cls is not None:
                         classes = detections.cls.cpu().numpy().astype(int)
                     else:
@@ -408,15 +527,59 @@ def main() -> None:
                 class_id = det["class_id"]
                 if class_id in plate_class_ids:
                     plate_detections.append(det)
-                elif vehicle_class_ids:
-                    if class_id in vehicle_class_ids:
+                elif not use_secondary_vehicle_model:
+                    if class_id in vehicle_class_ids or primary_auto_vehicle_fallback:
+                        # When the model does not expose explicit vehicle classes we still
+                        # want to keep the bounding boxes generated by the tracker so the
+                        # vehicle state machine can operate. Treat any non-plate class as a
+                        # vehicle in that scenario.
                         vehicle_detections.append(det)
-                elif auto_vehicle_fallback:
-                    # When the model does not expose explicit vehicle classes we still
-                    # want to keep the bounding boxes generated by the tracker so the
-                    # vehicle state machine can operate. Treat any non-plate class as a
-                    # vehicle in that scenario.
-                    vehicle_detections.append(det)
+
+            if use_secondary_vehicle_model and vehicle_detector is not None:
+                secondary_results = None
+                if config.input_mode == "images":
+                    secondary_results = vehicle_detector.predict(
+                        resized, verbose=False, **(vehicle_infer_kwargs or infer_kwargs)
+                    )
+                else:
+                    secondary_results = vehicle_detector.track(
+                        resized, persist=True, verbose=False, **(vehicle_infer_kwargs or infer_kwargs)
+                    )
+                if secondary_results:
+                    sec_detections = secondary_results[0].boxes
+                    if sec_detections is not None and len(sec_detections) > 0:
+                        v_boxes = sec_detections.xyxy.cpu().numpy().astype(int)
+                        if sec_detections.id is not None:
+                            v_track_ids = sec_detections.id.cpu().numpy().astype(int)
+                        else:
+                            generated_ids = np.arange(
+                                next_vehicle_track_id, next_vehicle_track_id + len(v_boxes)
+                            )
+                            v_track_ids = generated_ids.astype(int)
+                            next_vehicle_track_id += len(generated_ids)
+                        if sec_detections.cls is not None:
+                            v_classes = sec_detections.cls.cpu().numpy().astype(int)
+                        else:
+                            v_classes = np.zeros(len(v_boxes), dtype=int)
+                        if scale != 1.0 and len(v_boxes) > 0:
+                            v_boxes = (v_boxes / scale).astype(int)
+
+                        for idx in range(len(v_boxes)):
+                            class_id = int(v_classes[idx]) if v_classes.size > idx else 0
+                            if (
+                                class_id in secondary_vehicle_class_ids
+                                or secondary_auto_vehicle_fallback
+                            ):
+                                vehicle_detections.append(
+                                    {
+                                        "box": v_boxes[idx],
+                                        "track_id": int(v_track_ids[idx])
+                                        if v_track_ids.size > idx
+                                        else int(idx),
+                                        "class_id": class_id,
+                                        "source": "secondary",
+                                    }
+                                )
 
             active_plate_ids: set[int] = set()
             active_vehicle_ids: set[int] = set()
