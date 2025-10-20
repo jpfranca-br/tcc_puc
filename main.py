@@ -107,6 +107,51 @@ def main() -> None:
     config = parse_config()
     detector, infer_kwargs = _initialise_detector(config)
 
+    model_names = getattr(detector, "names", {}) or {}
+    if isinstance(model_names, dict):
+        class_name_map = {int(idx): str(name).lower() for idx, name in model_names.items()}
+    else:
+        class_name_map = {int(idx): str(name).lower() for idx, name in enumerate(model_names)}
+
+    plate_class_ids = {idx for idx, name in class_name_map.items() if "plate" in name}
+    vehicle_keywords = (
+        "vehicle",
+        "car",
+        "truck",
+        "bus",
+        "motorcycle",
+        "motorbike",
+        "van",
+        "automobile",
+        "auto",
+        "pickup",
+        "suv",
+        "carro",
+        "veiculo",
+        "caminhao",
+        "caminhonete",
+        "onibus",
+        "moto",
+    )
+    vehicle_class_ids = {
+        idx
+        for idx, name in class_name_map.items()
+        if any(keyword in name for keyword in vehicle_keywords)
+    }
+    if not plate_class_ids:
+        plate_class_ids = {0}
+    auto_vehicle_fallback = False
+    if not vehicle_class_ids:
+        fallback_ids = {idx for idx in class_name_map.keys() if idx not in plate_class_ids}
+        if fallback_ids:
+            vehicle_class_ids = fallback_ids
+        else:
+            auto_vehicle_fallback = True
+            print(
+                "No vehicle class names detected in the model metadata; "
+                "treating non-plate detections as vehicles."
+            )
+
     ocr_gpu = config.ocr_gpu and infer_kwargs.get("device", "cpu").startswith("cuda")
     # The OCR manager hides the differences between EasyOCR and Tesseract
     # so the rest of the loop can treat them uniformly.
@@ -155,8 +200,13 @@ def main() -> None:
         except Exception:
             pass
 
-    # Track meta information for each object ID produced by the tracker.
-    track_history: Dict[int, Dict[str, object]] = {}
+    # Track meta information for each detected plate and vehicle.
+    plate_history: Dict[int, Dict[str, object]] = {}
+    plate_id_map: Dict[int, int] = {}
+    plate_to_vehicle: Dict[int, int] = {}
+    vehicle_history: Dict[int, Dict[str, object]] = {}
+    vehicle_id_map: Dict[int, int] = {}
+    vehicle_to_plate: Dict[int, int] = {}
     ocr_method_stats: Dict[int, Dict[str, Dict[str, object]]] = {}
     ocr_accumulators: Dict[int, Dict[str, object]] = {}
 
@@ -165,6 +215,8 @@ def main() -> None:
     processed_frames = 0
     processing_start_ts = None
     next_track_id = 0
+    next_plate_global_id = 1
+    next_vehicle_global_id = 1
 
     yolo_last_dt = 0.0
     ocr_last_dt = 0.0
@@ -209,7 +261,7 @@ def main() -> None:
 
     processing_start_ts = time.perf_counter()
 
-    def _run_ocr_for_track(track_id: int, crop: np.ndarray, now_ts: float) -> OCRResult:
+    def _run_ocr_for_plate(plate_id: int, crop: np.ndarray, now_ts: float) -> OCRResult:
         """Execute OCR for a single track and update bookkeeping."""
 
         nonlocal ocr_calls, ocr_last_dt, ocr_min, ocr_max, ocr_success
@@ -219,19 +271,19 @@ def main() -> None:
         try:
             result = ocr_manager.run(crop)
         except Exception as exc:
-            print(f"OCR error for track {track_id}: {exc}")
+            print(f"OCR error for track {plate_id}: {exc}")
             result = OCRResult(None, 0.0, "-")
         ocr_last_dt = time.perf_counter() - ocr_t0
         ocr_min = min(ocr_min, ocr_last_dt)
         ocr_max = max(ocr_max, ocr_last_dt)
 
-        info = track_history.get(track_id)
+        info = plate_history.get(plate_id)
         if info is not None:
             info["last_ocr_attempt"] = now_ts
 
-        if track_id not in ocr_method_stats:
-            ocr_method_stats[track_id] = {}
-        track_methods = ocr_method_stats[track_id]
+        if plate_id not in ocr_method_stats:
+            ocr_method_stats[plate_id] = {}
+        track_methods = ocr_method_stats[plate_id]
         current_best = track_methods.get(result.method, {"best_conf": 0.0, "plate": ""})
         if result.confidence > current_best["best_conf"]:
             track_methods[result.method] = {
@@ -323,129 +375,288 @@ def main() -> None:
             ocr_retry_wait = config.ocr_min_wait
             track_ids = np.empty(0, dtype=int)
             boxes = np.empty((0, 4), dtype=int)
+            classes = np.empty(0, dtype=int)
             if results:
                 detections = results[0].boxes
                 if detections is not None and len(detections) > 0:
                     boxes = detections.xyxy.cpu().numpy().astype(int)
                     if detections.id is not None:
                         track_ids = detections.id.cpu().numpy().astype(int)
-                    elif config.input_mode == "images":
-                        track_ids = np.arange(next_track_id, next_track_id + len(boxes))
-                        next_track_id += len(track_ids)
+                    else:
+                        generated_ids = np.arange(next_track_id, next_track_id + len(boxes))
+                        track_ids = generated_ids.astype(int)
+                        next_track_id += len(generated_ids)
+                    if detections.cls is not None:
+                        classes = detections.cls.cpu().numpy().astype(int)
+                    else:
+                        classes = np.zeros(len(boxes), dtype=int)
                     if scale != 1.0 and len(boxes) > 0:
                         boxes = (boxes / scale).astype(int)
 
-            active_track_ids: set[int] = set()
-            # Convert YOLO output back into the original frame space.
-            if track_ids.size > 0:
-                active_track_ids = set(int(tid) for tid in track_ids)
+            detection_entries: List[Dict[str, object]] = []
+            for idx in range(len(boxes)):
+                entry = {
+                    "box": boxes[idx],
+                    "track_id": int(track_ids[idx]) if track_ids.size > idx else int(idx),
+                    "class_id": int(classes[idx]) if classes.size > idx else 0,
+                }
+                detection_entries.append(entry)
+
+            plate_detections: List[Dict[str, object]] = []
+            vehicle_detections: List[Dict[str, object]] = []
+            for det in detection_entries:
+                class_id = det["class_id"]
+                if class_id in plate_class_ids:
+                    plate_detections.append(det)
+                elif vehicle_class_ids:
+                    if class_id in vehicle_class_ids:
+                        vehicle_detections.append(det)
+                elif auto_vehicle_fallback:
+                    # When the model does not expose explicit vehicle classes we still
+                    # want to keep the bounding boxes generated by the tracker so the
+                    # vehicle state machine can operate. Treat any non-plate class as a
+                    # vehicle in that scenario.
+                    vehicle_detections.append(det)
+
+            active_plate_ids: set[int] = set()
+            active_vehicle_ids: set[int] = set()
+
+            if vehicle_detections:
+                current_vehicle_yolo_ids: set[int] = set()
+                for det in vehicle_detections:
+                    yolo_vehicle_id = int(det["track_id"])
+                    current_vehicle_yolo_ids.add(yolo_vehicle_id)
+                    vehicle_global_id = vehicle_id_map.get(yolo_vehicle_id)
+                    if vehicle_global_id is None:
+                        vehicle_global_id = next_vehicle_global_id
+                        next_vehicle_global_id += 1
+                        vehicle_id_map[yolo_vehicle_id] = vehicle_global_id
+                        vehicle_history[vehicle_global_id] = {
+                            "name": f"Vehicle_{vehicle_global_id}",
+                            "last_seen": now,
+                        }
+                    vehicle_info = vehicle_history.setdefault(
+                        vehicle_global_id, {"name": f"Vehicle_{vehicle_global_id}"}
+                    )
+                    vehicle_info["last_seen"] = now
+                    det["global_id"] = vehicle_global_id
+                    det["associated_plate"] = vehicle_to_plate.get(vehicle_global_id)
+                    active_vehicle_ids.add(vehicle_global_id)
+
+                for yolo_vehicle_id in list(vehicle_id_map.keys()):
+                    if yolo_vehicle_id not in current_vehicle_yolo_ids:
+                        vehicle_id_map.pop(yolo_vehicle_id, None)
+
+            current_plate_yolo_ids: set[int] = set()
+            for det in plate_detections:
+                yolo_plate_id = int(det["track_id"])
+                current_plate_yolo_ids.add(yolo_plate_id)
+
+                vehicle_global_id = None
+                if vehicle_detections:
+                    px1, py1, px2, py2 = det["box"]
+                    cx = (px1 + px2) / 2.0
+                    cy = (py1 + py2) / 2.0
+                    best_vehicle = None
+                    best_area = -1
+                    for veh in vehicle_detections:
+                        vehicle_id = veh.get("global_id")
+                        if vehicle_id is None:
+                            continue
+                        vx1, vy1, vx2, vy2 = veh["box"]
+                        if vx1 <= cx <= vx2 and vy1 <= cy <= vy2:
+                            area = max(0, vx2 - vx1) * max(0, vy2 - vy1)
+                            if area > best_area:
+                                best_vehicle = vehicle_id
+                                best_area = area
+                    vehicle_global_id = best_vehicle
+
+                plate_global_id = plate_id_map.get(yolo_plate_id)
+                if plate_global_id is None and vehicle_global_id is not None:
+                    plate_global_id = vehicle_to_plate.get(vehicle_global_id)
+                if plate_global_id is None:
+                    plate_global_id = next_plate_global_id
+                    next_plate_global_id += 1
+
+                plate_id_map[yolo_plate_id] = plate_global_id
+                info = plate_history.setdefault(
+                    plate_global_id,
+                    {
+                        "name": f"Plate_{plate_global_id}",
+                        "confidence": "",
+                        "ocr_done": False,
+                        "ocr_certain": False,
+                        "last_ocr_attempt": 0.0,
+                    },
+                )
+                info.setdefault("confidence", "")
+                info.setdefault("ocr_done", False)
+                info.setdefault("ocr_certain", False)
+                info.setdefault("last_ocr_attempt", 0.0)
+                info["last_seen"] = now
+
+                det["global_id"] = plate_global_id
+                det["vehicle_global_id"] = vehicle_global_id
+                active_plate_ids.add(plate_global_id)
+
+                if vehicle_global_id is not None:
+                    previous_vehicle = plate_to_vehicle.get(plate_global_id)
+                    if previous_vehicle is not None and previous_vehicle != vehicle_global_id:
+                        vehicle_to_plate.pop(previous_vehicle, None)
+                    vehicle_to_plate[vehicle_global_id] = plate_global_id
+                    plate_to_vehicle[plate_global_id] = vehicle_global_id
+
+            for yolo_plate_id in list(plate_id_map.keys()):
+                if yolo_plate_id not in current_plate_yolo_ids:
+                    plate_id_map.pop(yolo_plate_id, None)
+
+            for plate_id, vehicle_id in list(plate_to_vehicle.items()):
+                if vehicle_id not in active_vehicle_ids:
+                    plate_to_vehicle.pop(plate_id, None)
+            for vehicle_id in list(vehicle_to_plate.keys()):
+                if vehicle_id not in active_vehicle_ids:
+                    vehicle_to_plate.pop(vehicle_id, None)
+
+            num_plate_detections = len(plate_detections)
+            if num_plate_detections > 0:
                 if config.ocr_accumulate_best:
                     ocr_retry_wait = max(config.ocr_accumulation_seconds, 0.0)
                 else:
                     ocr_retry_wait = max(
                         config.ocr_min_wait,
-                        config.ocr_wait_multiplier * loop_dt * track_ids.size if loop_dt else config.ocr_min_wait,
+                        config.ocr_wait_multiplier * loop_dt * num_plate_detections if loop_dt else config.ocr_min_wait,
                     )
                 ocr_retry_max = max(ocr_retry_wait, ocr_retry_max)
                 ocr_retry_min = min(ocr_retry_wait, ocr_retry_min)
 
-                for box, track_id in zip(boxes, track_ids):
-                    if track_id not in track_history:
-                        track_history[track_id] = {
-                            "name": f"Plate_{len(track_history) + 1}",
-                            "confidence": "",
-                            "ocr_done": False,
-                            "ocr_certain": False,
-                            "last_ocr_attempt": 0.0,
-                        }
+            for det in plate_detections:
+                plate_id = det.get("global_id")
+                if plate_id is None:
+                    continue
+                info = plate_history.get(plate_id, {})
+                x1, y1, x2, y2 = det["box"]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(frame_width, x2), min(frame_height, y2)
+                crop = input_frame[y1:y2, x1:x2]
 
-                    info = track_history[track_id]
+                if config.ocr_accumulate_best:
+                    accumulator = ocr_accumulators.setdefault(
+                        plate_id,
+                        {
+                            "start": now,
+                            "best_area": 0,
+                            "best_crop": None,
+                            "last_seen": now,
+                        },
+                    )
+                    if info.get("ocr_certain"):
+                        ocr_accumulators.pop(plate_id, None)
+                        continue
 
-                    if config.ocr_accumulate_best:
-                        accumulator = ocr_accumulators.setdefault(
-                            track_id,
-                            {
-                                "start": now,
-                                "best_area": 0,
-                                "best_crop": None,
-                                "last_seen": now,
-                            },
-                        )
+                    accumulator["last_seen"] = now
+                    if crop.size > 0:
+                        area = crop.shape[0] * crop.shape[1]
+                        if area > accumulator.get("best_area", 0):
+                            accumulator["best_area"] = area
+                            accumulator["best_crop"] = crop.copy()
+                    wait_elapsed = now - accumulator.get("start", now)
+                    if (
+                        not info.get("ocr_certain")
+                        and wait_elapsed >= config.ocr_accumulation_seconds
+                        and accumulator.get("best_crop") is not None
+                    ):
+                        _run_ocr_for_plate(plate_id, accumulator["best_crop"], now)
                         if info.get("ocr_certain"):
-                            ocr_accumulators.pop(track_id, None)
-                            continue
+                            ocr_accumulators.pop(plate_id, None)
+                        else:
+                            accumulator["start"] = now
+                            accumulator["best_area"] = 0
+                            accumulator["best_crop"] = None
+                    continue
 
-                    x1, y1, x2, y2 = box
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(frame_width, x2), min(frame_height, y2)
-                    crop = input_frame[y1:y2, x1:x2]
+                if crop.size == 0:
+                    continue
 
-                    if config.ocr_accumulate_best:
-                        accumulator["last_seen"] = now
-                        if crop.size > 0:
-                            area = crop.shape[0] * crop.shape[1]
-                            if area > accumulator.get("best_area", 0):
-                                accumulator["best_area"] = area
-                                accumulator["best_crop"] = crop.copy()
-                        wait_elapsed = now - accumulator.get("start", now)
-                        if (
-                            not info.get("ocr_certain")
-                            and wait_elapsed >= config.ocr_accumulation_seconds
-                            and accumulator.get("best_crop") is not None
-                        ):
-                            _run_ocr_for_track(track_id, accumulator["best_crop"], now)
-                            if info.get("ocr_certain"):
-                                ocr_accumulators.pop(track_id, None)
-                            else:
-                                accumulator["start"] = now
-                                accumulator["best_area"] = 0
-                                accumulator["best_crop"] = None
-                        continue
+                if (not info.get("ocr_certain")) and (
+                    now - info.get("last_ocr_attempt", 0.0) > ocr_retry_wait
+                ):
+                    _run_ocr_for_plate(plate_id, crop, now)
 
-                    if crop.size == 0:
-                        continue
+            for det in plate_detections:
+                plate_id = det.get("global_id")
+                if plate_id is None:
+                    continue
+                info = plate_history.get(plate_id, {})
+                label = info.get("name", "") + info.get("confidence", "")
+                method_label = info.get("method", "")
+                if method_label:
+                    label += f" [{method_label}]"
+                color = (
+                    COLOR_GREEN
+                    if info.get("ocr_certain")
+                    else (COLOR_ORANGE if info.get("ocr_done") else COLOR_RED)
+                )
+                x1, y1, x2, y2 = det["box"]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(
+                    frame,
+                    label,
+                    (x1, max(0, y1 - 10)),
+                    cv2.FONT_HERSHEY_DUPLEX,
+                    0.9,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
 
-                    if (not info["ocr_certain"]) and (now - info["last_ocr_attempt"] > ocr_retry_wait):
-                        _run_ocr_for_track(track_id, crop, now)
-
-                for box, track_id in zip(boxes, track_ids):
-                    info = track_history.get(track_id, {})
-                    label = info.get("name", "") + info.get("confidence", "")
-                    method_label = info.get("method", "")
-                    if method_label:
-                        label += f" [{method_label}]"
-                    color = (
-                        COLOR_GREEN
-                        if info.get("ocr_certain")
-                        else (COLOR_ORANGE if info.get("ocr_done") else COLOR_RED)
+            for det in vehicle_detections:
+                vehicle_id = det.get("global_id")
+                if vehicle_id is None:
+                    continue
+                x1, y1, x2, y2 = det["box"]
+                associated_plate_id = vehicle_to_plate.get(vehicle_id)
+                plate_info = plate_history.get(associated_plate_id) if associated_plate_id else None
+                color = COLOR_RED
+                if plate_info:
+                    if plate_info.get("ocr_certain"):
+                        color = COLOR_GREEN
+                    elif plate_info.get("ocr_done"):
+                        color = COLOR_ORANGE
+                vehicle_label = vehicle_history.get(vehicle_id, {}).get(
+                    "name", f"Vehicle_{vehicle_id}"
+                )
+                if plate_info:
+                    vehicle_label += (
+                        f" -> {plate_info.get('name', '')}{plate_info.get('confidence', '')}"
                     )
-                    x1, y1, x2, y2 = box
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(
-                        frame,
-                        label,
-                        (x1, max(0, y1 - 10)),
-                        cv2.FONT_HERSHEY_DUPLEX,
-                        0.9,
-                        color,
-                        2,
-                        cv2.LINE_AA,
-                    )
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(
+                    frame,
+                    vehicle_label,
+                    (x1, max(0, y1 - 10)),
+                    cv2.FONT_HERSHEY_DUPLEX,
+                    0.9,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
 
             if config.ocr_accumulate_best:
-                lost_tracks = [tid for tid in list(ocr_accumulators.keys()) if tid not in active_track_ids]
-                for track_id in lost_tracks:
-                    accumulator = ocr_accumulators.pop(track_id)
-                    info = track_history.get(track_id)
+                lost_plates = [pid for pid in list(ocr_accumulators.keys()) if pid not in active_plate_ids]
+                for plate_id in lost_plates:
+                    accumulator = ocr_accumulators.pop(plate_id)
+                    info = plate_history.get(plate_id)
                     best_crop = accumulator.get("best_crop") if accumulator else None
                     if info and not info.get("ocr_certain") and best_crop is not None:
-                        _run_ocr_for_track(track_id, best_crop, now)
+                        _run_ocr_for_plate(plate_id, best_crop, now)
 
-            plates_total = len(track_history)
-            plates_certain = sum(1 for v in track_history.values() if v.get("ocr_certain"))
-            plates_done = sum(1 for v in track_history.values() if v.get("ocr_done") and not v.get("ocr_certain"))
+            plates_total = len(plate_history)
+            plates_certain = sum(1 for v in plate_history.values() if v.get("ocr_certain"))
+            plates_done = sum(
+                1 for v in plate_history.values() if v.get("ocr_done") and not v.get("ocr_certain")
+            )
             plates_pending = plates_total - (plates_done + plates_certain)
-            num_tracked = int(track_ids.size)
+            num_tracked = len(active_plate_ids)
 
             total_secs = max(1e-6, time.perf_counter() - (processing_start_ts or time.perf_counter()))
             overall_fps = processed_frames / total_secs
@@ -466,7 +677,8 @@ def main() -> None:
                 f"Fast Video      | {config.fast_video} (queue={config.frame_queue_size})",
                 f"Show Video      | {config.show_window}",
                 f"Detectd         | {plates_total}",
-                f"Tracked         | {num_tracked}",
+                f"Tracked plates  | {num_tracked}",
+                f"Vehicles active | {len(active_vehicle_ids)}",
                 f"OCR calls       | {ocr_calls}",
                 f"Plates          | bad={plates_pending} | average={plates_done} | ok={plates_certain}",
                 f"Frames          | {processed_frames} processed in {total_secs:0.2f}s | fps={overall_fps:0.2f}",
