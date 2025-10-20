@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import base64
+import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
 import cv2
@@ -17,6 +19,33 @@ class OCRResult:
     text: Optional[str]
     confidence: float
     method: str
+
+
+def _configure_logger() -> logging.Logger:
+    """Create a dedicated logger for OCR debugging."""
+
+    logger = logging.getLogger("ocr.chatgpt_visio")
+    if logger.handlers:
+        return logger
+
+    log_path = Path(os.getenv("OCR_LOG_PATH", "logs/ocr_debug.log"))
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler: logging.Handler = logging.FileHandler(log_path, encoding="utf-8")
+    except OSError:
+        handler = logging.StreamHandler()
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    )
+    handler.setFormatter(formatter)
+
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    logger.propagate = False
+
+    logger.debug("OCR logger initialised. Writing to %s", log_path)
+    return logger
 
 
 class OCRManager:
@@ -34,6 +63,7 @@ class OCRManager:
         self.easy_last_mode = "-"
         self.chatgpt_last_mode = "-"
         self._chatgpt_client = None
+        self._logger: Optional[logging.Logger] = None
         self._chatgpt_model = os.getenv("CHATGPT_VISION_MODEL", "gpt-4o-mini")
         self._load_engine()
 
@@ -55,6 +85,7 @@ class OCRManager:
                 ) from exc
 
             self._chatgpt_client = OpenAI()
+            self._logger = _configure_logger()
         else:
             raise ValueError("OCR engine must be 'easyocr', 'tesseract' or 'chatgpt_visio'")
 
@@ -167,6 +198,8 @@ class OCRManager:
 
         ok, encoded = cv2.imencode(".png", crop_bgr)
         if not ok:
+            if self._logger is not None:
+                self._logger.error("Failed to encode crop for ChatGPT Visio request")
             return None, 0.0, "encode_error"
 
         image_b64 = base64.b64encode(encoded).decode("utf-8")
@@ -175,6 +208,11 @@ class OCRManager:
             "Return only the plate characters you can confidently read. If nothing is readable, "
             "respond with UNKNOWN."
         )
+
+        if self._logger is not None:
+            self._logger.debug(
+                "Dispatching ChatGPT Visio OCR request with model=%s", self._chatgpt_model
+            )
 
         def _collect_fragments(value) -> list[str]:
             fragments: list[str] = []
@@ -224,7 +262,10 @@ class OCRManager:
                             "role": "user",
                             "content": [
                                 {"type": "input_text", "text": prompt},
-                                {"type": "input_image", "image_base64": image_b64},
+                                {
+                                    "type": "input_image",
+                                    "image": {"format": "png", "b64_json": image_b64},
+                                },
                             ],
                         }
                     ],
@@ -246,7 +287,9 @@ class OCRManager:
                         },
                     ],
                 )
-        except Exception:
+        except Exception as exc:
+            if self._logger is not None:
+                self._logger.exception("ChatGPT Visio OCR request failed: %s", exc)
             return None, 0.0, "request_error"
 
         text_response = ""
@@ -264,10 +307,20 @@ class OCRManager:
             if fragments:
                 text_response = " ".join(fragments)
 
+        if self._logger is not None:
+            self._logger.debug("ChatGPT Visio raw response text: %r", text_response)
+
         cleaned = "".join(filter(str.isalnum, (text_response or ""))).upper()
 
         if not cleaned or cleaned == "UNKNOWN":
+            if self._logger is not None:
+                self._logger.info(
+                    "ChatGPT Visio OCR returned no usable text. raw=%r", text_response
+                )
             return None, 0.0, "api"
+
+        if self._logger is not None:
+            self._logger.info("ChatGPT Visio OCR success: %s", cleaned)
 
         return cleaned, 1.0, "api"
 
