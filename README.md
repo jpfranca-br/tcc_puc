@@ -7,7 +7,7 @@ Streaming (HLS) output for headless environments.
 
 ## Features
 
-- YOLO-based plate detection with EasyOCR or Tesseract recognition.
+- YOLO-based plate detection with EasyOCR, Tesseract, or ChatGPT Visio recognition.
 - CPU/GPU flag to control the inference device.
 - Optional OpenCV preprocessing pipeline to improve detections.
 - HLS streaming server for viewing results on remote machines.
@@ -32,7 +32,7 @@ Create a virtual environment and install the Python dependencies:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install ultralytics opencv-python-headless numpy easyocr pytesseract torch torchvision torchaudio
+pip install ultralytics opencv-python-headless numpy easyocr pytesseract torch torchvision torchaudio openai
 ```
 
 > **Tip:** When using GPU acceleration, install the CUDA-enabled PyTorch build
@@ -51,7 +51,7 @@ Key options:
 
 - `--device {cpu,gpu}` toggles between CPU and GPU inference. If `gpu` is
   requested but unavailable, the script falls back to CPU automatically.
-- `--ocr-engine {easyocr,tesseract}` selects the OCR backend.
+- `--ocr-engine {easyocr,tesseract,chatgpt_visio}` selects the OCR backend.
 - `--enable-hls` starts the HLS pipeline. Visit
   `http://<host>:<port>/stream.m3u8` from an HLS-capable player (e.g. VLC or a
   browser with hls.js) to view the live stream.
@@ -59,13 +59,17 @@ Key options:
 
 Run `python main.py --help` to inspect the full list of options.
 
+When selecting `chatgpt_visio`, the OpenAI Python client looks for an
+`OPENAI_API_KEY` environment variable. Optionally override the model used for
+vision OCR by defining `CHATGPT_VISION_MODEL` (defaults to `gpt-4o-mini`).
+
 ## Project structure
 
 ```
 config.py        # Argument parsing and configuration dataclass
 capture.py       # Video capture helpers (prefetching wrapper)
 preprocessing.py # OpenCV preprocessing steps
-ocr.py           # OCR manager for EasyOCR/Tesseract
+ocr.py           # OCR manager for EasyOCR/Tesseract/ChatGPT Visio
 hud.py           # Heads-up display drawing utilities
 streaming.py     # HLS streaming utilities
 main.py          # Main loop orchestrating all modules
