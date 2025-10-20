@@ -103,6 +103,7 @@ def _setup_input(config: AppConfig):
 def main() -> None:
     """Execute the main processing loop."""
 
+    global SHOULD_STOP
     config = parse_config()
     detector, tracker_kwargs = _initialise_detector(config)
 
