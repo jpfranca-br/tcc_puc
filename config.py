@@ -97,7 +97,7 @@ def parse_config() -> AppConfig:
     parser.add_argument("--conf-threshold-low", type=float, default=0.50)
     parser.add_argument("--conf-threshold-high", type=float, default=0.80)
     parser.add_argument("--char-count-low", type=int, default=3)
-    parser.add_argument("--char-count-high", type=int, default=6)
+    parser.add_argument("--char-count-high", type=int, default=5)
     parser.add_argument("--ocr-wait-multiplier", type=float, default=3.0)
     parser.add_argument("--ocr-min-wait", type=float, default=0.5)
     parser.add_argument("--display-width", type=int, default=1280)
