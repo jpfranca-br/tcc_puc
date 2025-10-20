@@ -86,7 +86,11 @@ def parse_config() -> AppConfig:
     parser.add_argument("--target-yolo-width", type=int, default=640)
     parser.add_argument("--yolo-warmup", action="store_true", default=True)
     parser.add_argument("--no-yolo-warmup", action="store_false", dest="yolo_warmup")
-    parser.add_argument("--ocr-engine", choices=["easyocr", "tesseract"], default="easyocr")
+    parser.add_argument(
+        "--ocr-engine",
+        choices=["easyocr", "tesseract", "chatgpt_visio"],
+        default="easyocr",
+    )
     parser.add_argument("--ocr-gpu", action="store_true", default=True)
     parser.add_argument("--ocr-cpu", action="store_false", dest="ocr_gpu")
     parser.add_argument("--easyocr-multivariant", action="store_true", default=False)

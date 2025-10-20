@@ -1,8 +1,11 @@
 """OCR engine wrappers for license plate recognition."""
 from __future__ import annotations
 
+import base64
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
+
 import cv2
 import numpy as np
 
@@ -29,6 +32,9 @@ class OCRManager:
         self.reader = None
         self.tess_last_mode = "-"
         self.easy_last_mode = "-"
+        self.chatgpt_last_mode = "-"
+        self._chatgpt_client = None
+        self._chatgpt_model = os.getenv("CHATGPT_VISION_MODEL", "gpt-4o-mini")
         self._load_engine()
 
     def _load_engine(self) -> None:
@@ -40,8 +46,17 @@ class OCRManager:
             self.reader = easyocr.Reader(['en'], gpu=self.use_gpu)
         elif self.engine == "tesseract":
             import pytesseract  # noqa: F401  # imported for side effects only
+        elif self.engine == "chatgpt_visio":
+            try:
+                from openai import OpenAI
+            except ImportError as exc:
+                raise RuntimeError(
+                    "ChatGPT Visio OCR requires the 'openai' package to be installed"
+                ) from exc
+
+            self._chatgpt_client = OpenAI()
         else:
-            raise ValueError("OCR engine must be 'easyocr' or 'tesseract'")
+            raise ValueError("OCR engine must be 'easyocr', 'tesseract' or 'chatgpt_visio'")
 
     # --- EasyOCR helpers -------------------------------------------------
     def _easyocr_best(self, crop_bgr: np.ndarray) -> Tuple[Optional[str], float, str]:
@@ -143,6 +158,119 @@ class OCRManager:
 
         return (best_txt if best_txt else None), float(best_conf), best_key or "-"
 
+    # --- ChatGPT Visio helpers -------------------------------------------
+    def _chatgpt_visio_best(self, crop_bgr: np.ndarray) -> Tuple[Optional[str], float, str]:
+        """Send the crop to the ChatGPT Visio API for transcription."""
+
+        if self._chatgpt_client is None:
+            return None, 0.0, "uninitialised"
+
+        ok, encoded = cv2.imencode(".png", crop_bgr)
+        if not ok:
+            return None, 0.0, "encode_error"
+
+        image_b64 = base64.b64encode(encoded).decode("utf-8")
+        prompt = (
+            "You are an OCR system specialised in reading vehicle license plates. "
+            "Return only the plate characters you can confidently read. If nothing is readable, "
+            "respond with UNKNOWN."
+        )
+
+        def _collect_fragments(value) -> list[str]:
+            fragments: list[str] = []
+            if value is None:
+                return fragments
+            if isinstance(value, str):
+                if value:
+                    fragments.append(value)
+                return fragments
+            if isinstance(value, dict):
+                for key in ("text", "value"):
+                    fragment = value.get(key)
+                    if isinstance(fragment, str) and fragment:
+                        fragments.append(fragment)
+                for key in ("content", "contents"):
+                    nested = value.get(key)
+                    if isinstance(nested, (list, tuple, set)):
+                        for item in nested:
+                            fragments.extend(_collect_fragments(item))
+                    elif isinstance(nested, str):
+                        fragments.append(nested)
+                return fragments
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    fragments.extend(_collect_fragments(item))
+                return fragments
+
+            for attr in ("text", "value"):
+                fragment = getattr(value, attr, None)
+                if isinstance(fragment, str) and fragment:
+                    fragments.append(fragment)
+            for attr in ("content", "contents"):
+                nested = getattr(value, attr, None)
+                if isinstance(nested, (list, tuple, set)):
+                    for item in nested:
+                        fragments.extend(_collect_fragments(item))
+                elif isinstance(nested, str):
+                    fragments.append(nested)
+            return fragments
+
+        try:
+            if hasattr(self._chatgpt_client, "responses"):
+                response = self._chatgpt_client.responses.create(
+                    model=self._chatgpt_model,
+                    input=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": prompt},
+                                {"type": "input_image", "image_base64": image_b64},
+                            ],
+                        }
+                    ],
+                )
+            else:
+                response = self._chatgpt_client.chat.completions.create(
+                    model=self._chatgpt_model,
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Read the license plate characters."},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                                },
+                            ],
+                        },
+                    ],
+                )
+        except Exception:
+            return None, 0.0, "request_error"
+
+        text_response = ""
+        if hasattr(response, "output_text") and response.output_text:
+            text_response = response.output_text
+        else:
+            output = getattr(response, "output", None) or getattr(response, "outputs", None)
+            fragments = _collect_fragments(output)
+            if fragments:
+                text_response = " ".join(fragments)
+
+        if not text_response:
+            choices = getattr(response, "choices", None)
+            fragments = _collect_fragments(choices)
+            if fragments:
+                text_response = " ".join(fragments)
+
+        cleaned = "".join(filter(str.isalnum, (text_response or ""))).upper()
+
+        if not cleaned or cleaned == "UNKNOWN":
+            return None, 0.0, "api"
+
+        return cleaned, 1.0, "api"
+
     # ------------------------------------------------------------------
     def run(self, crop_bgr: np.ndarray) -> OCRResult:
         """Perform OCR on the provided crop."""
@@ -165,6 +293,11 @@ class OCRManager:
             self.easy_last_mode = mode if mode else "-"
             return OCRResult(txt if txt else None, conf if conf else 0.0, self.easy_last_mode)
 
+        if self.engine == "chatgpt_visio":
+            txt, conf, mode = self._chatgpt_visio_best(crop_bgr)
+            self.chatgpt_last_mode = mode if mode else "-"
+            return OCRResult(txt if txt else None, conf if conf else 0.0, self.chatgpt_last_mode)
+
         txt, conf, mode = self._tesseract_best(crop_bgr)
         self.tess_last_mode = mode if mode else "-"
         return OCRResult(txt if txt else None, conf if conf else 0.0, self.tess_last_mode)
@@ -174,6 +307,8 @@ class OCRManager:
 
         if self.engine == "tesseract":
             return f"Tess best={self.tess_last_mode}"
+        if self.engine == "chatgpt_visio":
+            return f"GPT best={self.chatgpt_last_mode}"
         if self.multivariant:
             return f"Easy best={self.easy_last_mode}"
         return "Easy single"
