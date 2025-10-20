@@ -51,8 +51,8 @@ def _initialise_detector(config: AppConfig) -> tuple[YOLO, dict]:
     detector = YOLO(config.model_path)
     detector.to(device_name)
 
-    tracker_kwargs: dict = {"device": device_name, "half": use_gpu}
-    return detector, tracker_kwargs
+    infer_kwargs: dict = {"device": device_name, "half": use_gpu}
+    return detector, infer_kwargs
 
 
 def _setup_input(config: AppConfig):
@@ -105,9 +105,9 @@ def main() -> None:
 
     global SHOULD_STOP
     config = parse_config()
-    detector, tracker_kwargs = _initialise_detector(config)
+    detector, infer_kwargs = _initialise_detector(config)
 
-    ocr_gpu = config.ocr_gpu and tracker_kwargs.get("device", "cpu").startswith("cuda")
+    ocr_gpu = config.ocr_gpu and infer_kwargs.get("device", "cpu").startswith("cuda")
     # The OCR manager hides the differences between EasyOCR and Tesseract
     # so the rest of the loop can treat them uniformly.
     ocr_manager = OCRManager(
@@ -143,7 +143,10 @@ def main() -> None:
 
     if config.yolo_warmup:
         dummy = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
-        detector.track(dummy, persist=True, verbose=False, **tracker_kwargs)
+        if config.input_mode == "images":
+            detector.predict(dummy, verbose=False, **infer_kwargs)
+        else:
+            detector.track(dummy, persist=True, verbose=False, **infer_kwargs)
         try:
             import torch
 
@@ -160,6 +163,7 @@ def main() -> None:
     ocr_success = 0
     processed_frames = 0
     processing_start_ts = None
+    next_track_id = 0
 
     yolo_last_dt = 0.0
     ocr_last_dt = 0.0
@@ -245,23 +249,35 @@ def main() -> None:
 
             # Run the detector and keep timing statistics.
             yolo_t0 = time.perf_counter()
-            results = detector.track(resized, persist=True, verbose=False, **tracker_kwargs)
+            if config.input_mode == "images":
+                results = detector.predict(resized, verbose=False, **infer_kwargs)
+            else:
+                results = detector.track(resized, persist=True, verbose=False, **infer_kwargs)
             yolo_last_dt = time.perf_counter() - yolo_t0
             yolo_min = min(yolo_min, yolo_last_dt)
             yolo_max = max(yolo_max, yolo_last_dt)
 
             now = time.perf_counter()
             ocr_retry_wait = config.ocr_min_wait
-            # Convert YOLO tracking output back into the original frame space.
-            if results and results[0].boxes.id is not None:
-                boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
-                track_ids = results[0].boxes.id.cpu().numpy().astype(int)
-                if scale != 1.0:
-                    boxes = (boxes / scale).astype(int)
+            track_ids = np.empty(0, dtype=int)
+            boxes = np.empty((0, 4), dtype=int)
+            if results:
+                detections = results[0].boxes
+                if detections is not None and len(detections) > 0:
+                    boxes = detections.xyxy.cpu().numpy().astype(int)
+                    if detections.id is not None:
+                        track_ids = detections.id.cpu().numpy().astype(int)
+                    elif config.input_mode == "images":
+                        track_ids = np.arange(next_track_id, next_track_id + len(boxes))
+                        next_track_id += len(track_ids)
+                    if scale != 1.0 and len(boxes) > 0:
+                        boxes = (boxes / scale).astype(int)
 
+            # Convert YOLO output back into the original frame space.
+            if track_ids.size > 0:
                 ocr_retry_wait = max(
                     config.ocr_min_wait,
-                    config.ocr_wait_multiplier * loop_dt * len(results[0].boxes.id) if loop_dt else config.ocr_min_wait,
+                    config.ocr_wait_multiplier * loop_dt * track_ids.size if loop_dt else config.ocr_min_wait,
                 )
                 ocr_retry_max = max(ocr_retry_wait, ocr_retry_max)
                 ocr_retry_min = min(ocr_retry_wait, ocr_retry_min)
@@ -365,7 +381,7 @@ def main() -> None:
             plates_certain = sum(1 for v in track_history.values() if v.get("ocr_certain"))
             plates_done = sum(1 for v in track_history.values() if v.get("ocr_done") and not v.get("ocr_certain"))
             plates_pending = plates_total - (plates_done + plates_certain)
-            num_tracked = len(results[0].boxes.id) if results and results[0].boxes.id is not None else 0
+            num_tracked = int(track_ids.size)
 
             total_secs = max(1e-6, time.perf_counter() - (processing_start_ts or time.perf_counter()))
             overall_fps = processed_frames / total_secs
@@ -380,7 +396,7 @@ def main() -> None:
                 f"Input source    | {input_desc}",
                 f"Input source fps| {fps:.2f}" if fps else "Input source fps| N/A",
                 f"OCR Engine      | {config.ocr_engine.upper()}  {ocr_manager.hud_status()}",
-                f"GPU             | {tracker_kwargs.get('device')}",
+                f"GPU             | {infer_kwargs.get('device')}",
                 f"Preprocessing   | {config.opencv_pre_yolo}",
                 f"Multivariant    | {config.easyocr_multivariant}",
                 f"Fast Video      | {config.fast_video} (queue={config.frame_queue_size})",
