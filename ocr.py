@@ -264,7 +264,9 @@ class OCRManager:
                                 {"type": "input_text", "text": prompt},
                                 {
                                     "type": "input_image",
-                                    "image": {"format": "png", "b64_json": image_b64},
+                                    "image_url": {
+                                        "url": f"data:image/png;base64,{image_b64}"
+                                    },
                                 },
                             ],
                         }
