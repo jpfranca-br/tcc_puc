@@ -77,7 +77,7 @@ def parse_config() -> AppConfig:
     parser.add_argument("--images-dir", default="./data/images_in")
     parser.add_argument("--images-per-second", type=float, default=5.0)
     parser.add_argument("--fast-video", action="store_true", default="False")
-    parser.add_argument("--no-fast-video", action="store_false", dst="fast-video")
+    parser.add_argument("--no-fast-video", action="store_false", dest="fast-video")
     parser.add_argument("--frame-queue-size", type=int, default=8)
     parser.add_argument("--show-window", action="store_true", default=True)
     parser.add_argument("--no-window", action="store_false", dest="show_window")
