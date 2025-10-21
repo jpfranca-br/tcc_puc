@@ -6,7 +6,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -19,6 +19,36 @@ class OCRResult:
     text: Optional[str]
     confidence: float
     method: str
+
+
+@dataclass(frozen=True)
+class OCRCriteria:
+    """Thresholds used to determine whether a recognition is acceptable."""
+
+    confidence_low: float
+    confidence_high: float
+    chars_low: int
+    chars_high: int
+
+
+@dataclass
+class OCRAttempt:
+    """Single OCR attempt metadata used for auditing."""
+
+    area: int
+    method: str
+    text: Optional[str]
+    confidence: float
+    status: str
+
+
+@dataclass
+class OCRBatchResult:
+    """Outcome of processing a batch of candidates."""
+
+    status: str
+    best_result: Optional[OCRResult]
+    attempts: List[OCRAttempt]
 
 
 def _configure_logger() -> logging.Logger:
@@ -367,3 +397,97 @@ class OCRManager:
         if self.multivariant:
             return f"Easy best={self.easy_last_mode}"
         return "Easy single"
+
+
+def _classify_result(result: OCRResult, criteria: OCRCriteria) -> str:
+    """Categorise ``result`` according to the provided ``criteria``."""
+
+    text = result.text or ""
+    length = len(text)
+    if length == 0:
+        return "rejected"
+    if length >= criteria.chars_high and result.confidence >= criteria.confidence_high:
+        return "approved"
+    if length >= criteria.chars_low and result.confidence >= criteria.confidence_low:
+        return "candidate"
+    return "rejected"
+
+
+def process_image_batch(
+    manager: OCRManager,
+    images: Sequence[np.ndarray],
+    criteria: OCRCriteria,
+) -> OCRBatchResult:
+    """Process ``images`` sequentially until an approved result is found.
+
+    The inputs are evaluated from the largest to the smallest crop in order to
+    prioritise high-resolution candidates. The function stops once an
+    ``approved`` result is obtained according to ``criteria``. If no approved
+    result is produced, the best attempt (if any) is returned and the batch is
+    marked as ``ocr_no_match`` so callers can decide whether a retry is needed.
+    """
+
+    if not images:
+        return OCRBatchResult(status="ocr_no_match", best_result=None, attempts=[])
+
+    indexed: List[tuple[int, np.ndarray]] = []
+    for idx, img in enumerate(images):
+        if img is None or not isinstance(img, np.ndarray):
+            continue
+        h, w = img.shape[:2]
+        area = max(0, int(h) * int(w))
+        if area == 0:
+            continue
+        indexed.append((area, img))
+
+    if not indexed:
+        return OCRBatchResult(status="ocr_no_match", best_result=None, attempts=[])
+
+    indexed.sort(key=lambda item: item[0], reverse=True)
+
+    attempts: List[OCRAttempt] = []
+    best_result: Optional[OCRResult] = None
+    best_status = "rejected"
+
+    for area, image in indexed:
+        try:
+            result = manager.run(image)
+        except Exception:
+            attempts.append(
+                OCRAttempt(
+                    area=area,
+                    method="error",
+                    text=None,
+                    confidence=0.0,
+                    status="error",
+                )
+            )
+            continue
+
+        status = _classify_result(result, criteria)
+        attempts.append(
+            OCRAttempt(
+                area=area,
+                method=result.method,
+                text=result.text,
+                confidence=result.confidence,
+                status=status,
+            )
+        )
+
+        if result.text and (
+            best_result is None or result.confidence > best_result.confidence
+        ):
+            best_result = result
+            best_status = status
+
+        if status == "approved":
+            return OCRBatchResult(status="ocr_ok", best_result=result, attempts=attempts)
+
+    final_status = "ocr_no_match"
+    if best_result is None:
+        best_status = "rejected"
+    elif best_status == "approved":
+        final_status = "ocr_ok"
+
+    return OCRBatchResult(status=final_status, best_result=best_result, attempts=attempts)
