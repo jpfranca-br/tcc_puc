@@ -7,6 +7,9 @@ import signal
 import time
 import uuid
 import atexit
+import threading
+from dataclasses import dataclass
+from queue import Empty, Queue
 from typing import Dict, List
 
 import cv2
@@ -132,6 +135,27 @@ def _setup_input(config: AppConfig):
     frame_height, frame_width = first.shape[:2]
     fps = float(config.images_per_second) if config.images_per_second > 0 else 0.1
     return files, None, frame_width, frame_height, fps, 0
+
+
+@dataclass
+class OCRSubmissionTask:
+    plate_id: int
+    request_id: str
+    images: List[np.ndarray]
+    callback_url: str
+    engine: str
+    use_multivariant: bool
+    reason: str
+
+
+@dataclass
+class OCRSubmissionResult:
+    plate_id: int
+    request_id: str
+    success: bool
+    sent_ts: float | None
+    reason: str
+    error: str | None = None
 
 
 class AsyncOCRClient:
@@ -375,6 +399,50 @@ def main() -> None:
         timeout=config.ocr_submit_timeout,
     )
 
+    submission_queue: "Queue[OCRSubmissionTask | None]" = Queue()
+    submission_results: "Queue[OCRSubmissionResult]" = Queue()
+
+    def _submission_worker() -> None:
+        while True:
+            task = submission_queue.get()
+            if task is None:
+                submission_queue.task_done()
+                break
+
+            sent_ts: float | None = None
+            success = False
+            error: str | None = None
+            try:
+                success = ocr_client.submit(
+                    request_id=task.request_id,
+                    images=task.images,
+                    callback_url=task.callback_url,
+                    engine=task.engine,
+                    use_multivariant=task.use_multivariant,
+                )
+                if success:
+                    sent_ts = time.perf_counter()
+            except Exception as exc:  # pragma: no cover - defensive
+                success = False
+                error = str(exc)
+            finally:
+                submission_results.put(
+                    OCRSubmissionResult(
+                        plate_id=task.plate_id,
+                        request_id=task.request_id,
+                        success=success,
+                        sent_ts=sent_ts,
+                        reason=task.reason,
+                        error=error,
+                    )
+                )
+                submission_queue.task_done()
+
+    submission_worker = threading.Thread(
+        target=_submission_worker, name="ocr-submission-worker", daemon=True
+    )
+    submission_worker.start()
+
     callback_store = CallbackStore()
     callback_server: CallbackServer | None = None
     callback_url = config.callback_url or f"http://{config.callback_host}:{config.callback_port}/callback/ocr-result"
@@ -487,6 +555,40 @@ def main() -> None:
 
     processing_start_ts = time.perf_counter()
 
+    def _handle_submission_result(result: OCRSubmissionResult) -> None:
+        nonlocal ocr_jobs_submitted, ocr_jobs_errors
+
+        info = plate_history.get(result.plate_id)
+        accumulator = plate_accumulators.get(result.plate_id)
+
+        if result.success:
+            ocr_jobs_submitted += 1
+            plate_jobs[result.request_id] = result.plate_id
+            job_sent_ts[result.request_id] = result.sent_ts or time.perf_counter()
+            if info is not None:
+                info["status"] = PLATE_STATUS_WAITING
+                info["job_id"] = result.request_id
+                info["last_submission_reason"] = result.reason
+            if accumulator is not None:
+                accumulator["sent"] = True
+                accumulator["job_id"] = result.request_id
+        else:
+            ocr_jobs_errors += 1
+            if info is not None:
+                info["status"] = PLATE_STATUS_ERROR
+                info["job_id"] = None
+            if accumulator is not None:
+                accumulator["sent"] = False
+                accumulator["job_id"] = None
+
+    def _drain_submission_results() -> None:
+        while True:
+            try:
+                result = submission_results.get_nowait()
+            except Empty:
+                break
+            _handle_submission_result(result)
+
     def _submit_plate_to_ocr(
         plate_id: int,
         accumulator: Dict[str, object],
@@ -509,38 +611,36 @@ def main() -> None:
             return False
 
         request_id = f"{plate_id}-{uuid.uuid4().hex}"
-        success = ocr_client.submit(
-            request_id=request_id,
-            images=images,
-            callback_url=callback_url,
-            engine=config.ocr_engine,
-            use_multivariant=config.easyocr_multivariant,
-        )
-
-        if not success:
-            info["status"] = PLATE_STATUS_ERROR
-            info["job_id"] = None
-            ocr_jobs_errors += 1
-            return False
 
         accumulator["samples"] = []
         accumulator["start"] = now_ts
         accumulator["sent"] = True
         accumulator["job_id"] = request_id
-        plate_jobs[request_id] = plate_id
-        job_sent_ts[request_id] = time.perf_counter()
 
-        info["status"] = PLATE_STATUS_WAITING
         info["job_id"] = request_id
         info["last_ocr_attempt"] = now_ts
         info["last_submission_reason"] = reason
+        info["status"] = PLATE_STATUS_WAITING
 
-        ocr_jobs_submitted += 1
+        submission_queue.put(
+            OCRSubmissionTask(
+                plate_id=plate_id,
+                request_id=request_id,
+                images=images,
+                callback_url=callback_url,
+                engine=config.ocr_engine,
+                use_multivariant=config.easyocr_multivariant,
+                reason=reason,
+            )
+        )
+
         return True
 
     try:
         # Main processing loop that stops on EOF or when a signal is received.
         while not SHOULD_STOP:
+            _drain_submission_results()
+
             loop_t0 = time.perf_counter()
             # ``source`` is a list in image mode; otherwise it behaves like a capture.
             if isinstance(source, list):
@@ -581,6 +681,7 @@ def main() -> None:
             yolo_max = max(yolo_max, yolo_last_dt)
 
             now = time.perf_counter()
+            _drain_submission_results()
 
             for callback in callback_store.consume():
                 plate_id = plate_jobs.pop(callback.request_id, None)
@@ -1111,6 +1212,7 @@ def main() -> None:
                     while True:
                         if time.perf_counter() >= next_show_time:
                             break
+                        _drain_submission_results()
                         if config.show_window:
                             if cv2.waitKey(10) & 0xFF == ord("q"):
                                 SHOULD_STOP = True
@@ -1118,6 +1220,8 @@ def main() -> None:
 
             if SHOULD_STOP:
                 break
+
+            _drain_submission_results()
 
             loop_dt = time.perf_counter() - loop_t0
             loop_min = min(loop_min, loop_dt)
@@ -1127,6 +1231,11 @@ def main() -> None:
         pass
     finally:
         print("Processing finished. Releasing resources.")
+        submission_queue.put(None)
+        submission_queue.join()
+        if submission_worker.is_alive():
+            submission_worker.join()
+        _drain_submission_results()
         # Release whichever capture implementation we used.
         if isinstance(source, PrefetchCapture):
             source.release()
