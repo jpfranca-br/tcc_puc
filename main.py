@@ -734,6 +734,10 @@ def main() -> None:
             active_plate_ids: set[int] = set()
             active_vehicle_ids: set[int] = set()
 
+            vehicle_boxes_array = np.empty((0, 4), dtype=float)
+            vehicle_areas = np.empty(0, dtype=float)
+            vehicle_global_ids_array = np.empty(0, dtype=int)
+
             if vehicle_detections:
                 current_vehicle_yolo_ids: set[int] = set()
                 for det in vehicle_detections:
@@ -756,33 +760,68 @@ def main() -> None:
                     det["associated_plate"] = vehicle_to_plate.get(vehicle_global_id)
                     active_vehicle_ids.add(vehicle_global_id)
 
+                vehicle_boxes_array = np.array(
+                    [np.asarray(det["box"], dtype=float) for det in vehicle_detections],
+                    dtype=float,
+                )
+                widths = np.maximum(0.0, vehicle_boxes_array[:, 2] - vehicle_boxes_array[:, 0])
+                heights = np.maximum(0.0, vehicle_boxes_array[:, 3] - vehicle_boxes_array[:, 1])
+                vehicle_areas = widths * heights
+                vehicle_global_ids_array = np.array(
+                    [
+                        int(global_id) if global_id is not None else -1
+                        for det in vehicle_detections
+                        for global_id in (det.get("global_id"),)
+                    ],
+                    dtype=int,
+                )
+
                 for yolo_vehicle_id in list(vehicle_id_map.keys()):
                     if yolo_vehicle_id not in current_vehicle_yolo_ids:
                         vehicle_id_map.pop(yolo_vehicle_id, None)
 
             current_plate_yolo_ids: set[int] = set()
-            for det in plate_detections:
+            plate_vehicle_indices = np.full(len(plate_detections), -1, dtype=int)
+
+            if plate_detections:
+                plate_boxes_array = np.array(
+                    [np.asarray(det["box"], dtype=float) for det in plate_detections],
+                    dtype=float,
+                )
+                cx = (plate_boxes_array[:, 0] + plate_boxes_array[:, 2]) / 2.0
+                cy = (plate_boxes_array[:, 1] + plate_boxes_array[:, 3]) / 2.0
+
+                if vehicle_boxes_array.size and vehicle_global_ids_array.size:
+                    valid_vehicle_mask = vehicle_global_ids_array >= 0
+                    valid_vehicle_indices = np.flatnonzero(valid_vehicle_mask)
+                    if valid_vehicle_indices.size > 0:
+                        valid_boxes = vehicle_boxes_array[valid_vehicle_indices]
+                        valid_areas = vehicle_areas[valid_vehicle_indices]
+                        contains = (
+                            (valid_boxes[:, 0, None] <= cx)
+                            & (valid_boxes[:, 2, None] >= cx)
+                            & (valid_boxes[:, 1, None] <= cy)
+                            & (valid_boxes[:, 3, None] >= cy)
+                        )
+                        if contains.size:
+                            candidate_areas = np.where(contains, valid_areas[:, None], -np.inf)
+                            best_candidate_indices = np.argmax(candidate_areas, axis=0)
+                            has_match = contains.any(axis=0)
+                            for plate_idx in np.flatnonzero(has_match):
+                                vehicle_array_index = valid_vehicle_indices[
+                                    best_candidate_indices[plate_idx]
+                                ]
+                                plate_vehicle_indices[plate_idx] = int(vehicle_array_index)
+
+            for idx, det in enumerate(plate_detections):
                 yolo_plate_id = int(det["track_id"])
                 current_plate_yolo_ids.add(yolo_plate_id)
 
                 vehicle_global_id = None
-                if vehicle_detections:
-                    px1, py1, px2, py2 = det["box"]
-                    cx = (px1 + px2) / 2.0
-                    cy = (py1 + py2) / 2.0
-                    best_vehicle = None
-                    best_area = -1
-                    for veh in vehicle_detections:
-                        vehicle_id = veh.get("global_id")
-                        if vehicle_id is None:
-                            continue
-                        vx1, vy1, vx2, vy2 = veh["box"]
-                        if vx1 <= cx <= vx2 and vy1 <= cy <= vy2:
-                            area = max(0, vx2 - vx1) * max(0, vy2 - vy1)
-                            if area > best_area:
-                                best_vehicle = vehicle_id
-                                best_area = area
-                    vehicle_global_id = best_vehicle
+                vehicle_index = plate_vehicle_indices[idx]
+                if 0 <= vehicle_index < vehicle_global_ids_array.size:
+                    matched_id = vehicle_global_ids_array[vehicle_index]
+                    vehicle_global_id = int(matched_id) if matched_id >= 0 else None
 
                 plate_global_id = plate_id_map.get(yolo_plate_id)
                 if plate_global_id is None and vehicle_global_id is not None:
@@ -826,6 +865,8 @@ def main() -> None:
                         vehicle_to_plate.pop(previous_vehicle, None)
                     vehicle_to_plate[vehicle_global_id] = plate_global_id
                     plate_to_vehicle[plate_global_id] = vehicle_global_id
+                    if 0 <= vehicle_index < len(vehicle_detections):
+                        vehicle_detections[vehicle_index]["associated_plate"] = plate_global_id
 
             for yolo_plate_id in list(plate_id_map.keys()):
                 if yolo_plate_id not in current_plate_yolo_ids:
