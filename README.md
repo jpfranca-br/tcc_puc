@@ -9,7 +9,9 @@ Streaming (HLS) output for headless environments.
 
 - YOLO-based plate detection with EasyOCR, Tesseract, or ChatGPT Visio recognition.
 - CPU/GPU flag to control the inference device.
-- Optional OpenCV preprocessing pipeline to improve detections.
+- Asynchronous OCR processing via a dedicated HTTP endpoint with callback support.
+- Real-time HUD showing the new plate lifecycle statuses (accumulating, waiting,
+  error, ok, and no_match).
 - HLS streaming server for viewing results on remote machines.
 - Background frame prefetching for improved throughput.
 
@@ -32,7 +34,8 @@ Create a virtual environment and install the Python dependencies:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install ultralytics opencv-python-headless numpy easyocr pytesseract torch torchvision torchaudio openai
+pip install ultralytics opencv-python-headless numpy easyocr pytesseract torch torchvision torchaudio openai \
+            fastapi uvicorn requests
 ```
 
 > **Tip:** When using GPU acceleration, install the CUDA-enabled PyTorch build
@@ -68,8 +71,9 @@ vision OCR by defining `CHATGPT_VISION_MODEL` (defaults to `gpt-4o-mini`).
 ```
 config.py        # Argument parsing and configuration dataclass
 capture.py       # Video capture helpers (prefetching wrapper)
-preprocessing.py # OpenCV preprocessing steps
 ocr.py           # OCR manager for EasyOCR/Tesseract/ChatGPT Visio
+ocr_endpoint.py  # FastAPI service that accepts async OCR jobs and posts callbacks
+callback_endpoint.py # FastAPI service receiving OCR callbacks and updating state
 hud.py           # Heads-up display drawing utilities
 streaming.py     # HLS streaming utilities
 main.py          # Main loop orchestrating all modules
@@ -77,6 +81,38 @@ main.py          # Main loop orchestrating all modules
 
 Input assets reside in `data/input`, while processed artefacts (videos and HLS
 segments) are written to `data/output` and `data/hls` respectively.
+
+## Asynchronous OCR workflow
+
+OCR requests are no longer executed inline with the detection loop. Instead the
+pipeline accumulates up to five of the largest plate crops for each track and
+submits them to `ocr_endpoint.py`. The service evaluates the candidates in
+descending size order and immediately responds through a callback to
+`callback_endpoint.py`, allowing the main loop to continue tracking vehicles in
+parallel.
+
+Each plate moves through the following statuses which are also reflected in the
+HUD and overlay colours:
+
+| Status         | Colour | Description |
+| -------------- | ------ | ----------- |
+| `accumulating` | White  | Gathering crops before contacting the OCR service. |
+| `ocr_waiting`  | Yellow | Awaiting a response from the OCR endpoint. |
+| `ocr_error`    | Red    | Submission failed or the endpoint signalled an error. |
+| `ocr_ok`       | Blue   | Validated plate (no further OCR calls required). |
+| `ocr_no_match` | Orange | OCR returned but confidence was insufficient; a retry will occur. |
+
+The callback server is started automatically by `main.py`. If you wish to run
+the components independently, launch them in separate terminals:
+
+```bash
+python ocr_endpoint.py
+python callback_endpoint.py
+```
+
+Use the `--ocr-endpoint-url`, `--callback-host`, `--callback-port`, and
+`--callback-url` options to tailor the network topology when the services run on
+different machines.
 
 ## Testing
 
